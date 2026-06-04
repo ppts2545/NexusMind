@@ -1,0 +1,21 @@
+version: "3.9"
+
+# Overlay for local development — hot-reload for API and frontend.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  api:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DEBUG: "true"
+
+  frontend:
+    build:
+      context: ./frontend
+      target: deps       # install deps only, mount source for hot-reload
+    command: npm run dev
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
