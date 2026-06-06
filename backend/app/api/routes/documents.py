@@ -1,103 +1,140 @@
+"""Document management endpoints."""
+from __future__ import annotations
+
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select
+from pydantic import BaseModel
 
-from app.db.models import Document, DocumentSource, DocumentStatus
-from app.db.session import get_db
-from app.models.document import CrawlRequest, DocumentIngest, DocumentList, DocumentResponse
-from app.workers.tasks import crawl_and_ingest, ingest_document
+from app.api.deps import get_document_repo, get_ingestion_service, get_vector_store
+from app.repositories.document import DocumentRepository
+from app.services.ingestion import IngestionService
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 
-@router.post("/", response_model=DocumentResponse, status_code=status.HTTP_202_ACCEPTED)
-async def ingest(payload: DocumentIngest, db: AsyncSession = Depends(get_db)):
-    if not payload.content and not payload.source_url:
-        raise HTTPException(status_code=400, detail="Provide either 'content' or 'source_url'.")
+class DocumentIngestRequest(BaseModel):
+    title: str
+    content: str | None = None
+    url: str | None = None
+    source: str = "api"
+    meta: dict | None = None
 
-    doc = Document(
-        id=uuid.uuid4(),
-        title=payload.title,
-        source_url=str(payload.source_url) if payload.source_url else None,
-        source_type=DocumentSource.API,
-        status=DocumentStatus.PENDING,
-        mime_type=payload.mime_type,
-        meta=payload.meta,
-    )
-    db.add(doc)
-    await db.commit()
-    await db.refresh(doc)
+
+class DocumentResponse(BaseModel):
+    id: str
+    title: str
+    source: str
+    source_type: str
+    url: str | None
+    status: str
+    chunk_count: int
+    word_count: int
+    language: str | None
+    created_at: str
+
+    model_config = {"from_attributes": True}
+
+
+class DocumentListResponse(BaseModel):
+    items: list[DocumentResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+@router.post("/", response_model=DocumentResponse, status_code=status.HTTP_202_ACCEPTED)
+async def ingest_document(
+    payload: DocumentIngestRequest,
+    ingestion: IngestionService = Depends(get_ingestion_service),
+    doc_repo: DocumentRepository = Depends(get_document_repo),
+):
+    if not payload.content and not payload.url:
+        raise HTTPException(status_code=400, detail="Provide 'content' or 'url'.")
 
     content = payload.content or ""
-    ingest_document.delay(str(doc.id), content, payload.title, payload.meta)
-    return doc
+    await ingestion.ingest_text(payload.title, content, source=payload.source, url=payload.url)
+
+    docs = await doc_repo.list(limit=1)
+    if not docs:
+        raise HTTPException(status_code=500, detail="Ingestion failed silently.")
+
+    return _doc_response(docs[0])
 
 
 @router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_202_ACCEPTED)
-async def upload(file: UploadFile, db: AsyncSession = Depends(get_db)):
+async def upload_document(
+    file: UploadFile,
+    ingestion: IngestionService = Depends(get_ingestion_service),
+    doc_repo: DocumentRepository = Depends(get_document_repo),
+):
     raw = await file.read()
-    try:
-        content = raw.decode("utf-8", errors="replace")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Unable to decode file as text.")
+    content = raw.decode("utf-8", errors="replace")
 
-    doc = Document(
-        id=uuid.uuid4(),
+    await ingestion.ingest_text(
         title=file.filename or "uploaded_file",
-        source_type=DocumentSource.UPLOAD,
-        status=DocumentStatus.PENDING,
-        mime_type=file.content_type or "text/plain",
+        text=content,
+        source=f"upload:{file.filename}",
     )
-    db.add(doc)
-    await db.commit()
-    await db.refresh(doc)
 
-    ingest_document.delay(str(doc.id), content, doc.title, None)
-    return doc
-
-
-@router.post("/crawl", status_code=status.HTTP_202_ACCEPTED)
-async def crawl(payload: CrawlRequest):
-    task = crawl_and_ingest.delay(
-        str(payload.url),
-        payload.max_depth,
-        payload.max_pages,
-        payload.follow_external,
-    )
-    return {"task_id": task.id, "start_url": str(payload.url)}
+    docs = await doc_repo.list(limit=1)
+    if not docs:
+        raise HTTPException(status_code=500, detail="Upload ingestion failed.")
+    return _doc_response(docs[0])
 
 
-@router.get("/", response_model=DocumentList)
-async def list_documents(page: int = 1, page_size: int = 20, db: AsyncSession = Depends(get_db)):
+@router.get("/", response_model=DocumentListResponse)
+async def list_documents(
+    page: int = 1,
+    page_size: int = 20,
+    doc_repo: DocumentRepository = Depends(get_document_repo),
+):
     offset = (page - 1) * page_size
-    total_result = await db.execute(select(func.count()).select_from(Document))
-    total = total_result.scalar_one()
-    result = await db.execute(select(Document).offset(offset).limit(page_size).order_by(Document.created_at.desc()))
-    docs = result.scalars().all()
-    return DocumentList(items=list(docs), total=total, page=page, page_size=page_size)
+    items = await doc_repo.list(offset=offset, limit=page_size)
+    total = await doc_repo.count()
+    return DocumentListResponse(
+        items=[_doc_response(d) for d in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
-async def get_document(document_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Document).where(Document.id == document_id))
-    doc = result.scalar_one_or_none()
+async def get_document(
+    document_id: uuid.UUID,
+    doc_repo: DocumentRepository = Depends(get_document_repo),
+):
+    doc = await doc_repo.get(document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found.")
-    return doc
+    return _doc_response(doc)
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_document(document_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Document).where(Document.id == document_id))
-    doc = result.scalar_one_or_none()
+async def delete_document(
+    document_id: uuid.UUID,
+    doc_repo: DocumentRepository = Depends(get_document_repo),
+    vector_store=Depends(get_vector_store),
+):
+    doc = await doc_repo.get(document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    from app.services.vector_store import VectorStore
-    vs = VectorStore()
-    await vs.delete_by_document(str(document_id))
+    await vector_store.delete_by_document(str(document_id))
+    await doc_repo.delete(doc)
 
-    await db.delete(doc)
-    await db.commit()
+
+def _doc_response(d) -> DocumentResponse:
+    return DocumentResponse(
+        id=str(d.id),
+        title=d.title,
+        source=d.source,
+        source_type=str(d.source_type),
+        url=d.url,
+        status=str(d.status),
+        chunk_count=d.chunk_count,
+        word_count=getattr(d, "word_count", 0),
+        language=d.language,
+        created_at=d.created_at.isoformat(),
+    )

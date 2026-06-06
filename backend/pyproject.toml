@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "nexusmind"
+version = "2.0.0"
+description = "Production-grade AI Knowledge Platform — RAG + Fine-tuning + Training"
+requires-python = ">=3.12"
+
+dependencies = [
+    # Web framework
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.1",
+    "python-multipart==0.0.12",
+
+    # Settings & validation
+    "pydantic==2.10.3",
+    "pydantic-settings==2.6.1",
+
+    # Database
+    "sqlalchemy==2.0.36",
+    "asyncpg==0.30.0",
+    "alembic==1.14.0",
+
+    # Vector store — Qdrant (primary)
+    "qdrant-client[fastembed]>=1.9.0",
+
+    # Vector store — ChromaDB (backward compat)
+    "chromadb==0.5.23",
+
+    # Object storage (MinIO / S3)
+    "aioboto3>=13.0.0",
+    "boto3>=1.35.0",
+
+    # Embeddings
+    "sentence-transformers==3.3.1",
+
+    # LLM
+    "anthropic==0.40.0",
+
+    # Async HTTP / crawling
+    "httpx==0.28.1",
+    "beautifulsoup4==4.12.3",
+    "lxml>=6.0.1",
+    "feedparser==6.0.11",
+    "python-dateutil==2.9.0",
+
+    # PDF extraction
+    "pypdf>=4.0.0",
+
+    # HuggingFace sources
+    "datasets>=2.19.0",
+    "huggingface-hub>=0.23.0",
+
+    # Common Crawl WARC
+    "warcio>=1.7.4",
+
+    # Cleaning & deduplication
+    "datasketch>=1.6.4",
+    "ftfy>=6.2.0",
+    "langdetect==1.0.9",
+
+    # Web search fallback
+    "tavily-python>=0.3.0",
+
+    # Training / dataset output
+    "pyarrow>=16.0.0",
+
+    # Task queue
+    "celery[redis]==5.4.0",
+    "redis==5.2.1",
+
+    # Logging
+    "structlog==24.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==6.0.0",
+    "httpx==0.28.1",
+    "factory-boy>=3.3.0",
+    "respx>=0.21.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
