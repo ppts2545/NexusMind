@@ -156,14 +156,41 @@ class IngestionService:
         embeddings = await self._embedder.embed_async(texts)
 
         vector_ids = [str(uuid.uuid4()) for _ in chunks]
+
+        # ── Rich Metadata สำหรับ Filtered Vector Search ──────────────────
+        #
+        # ทุก chunk ที่เก็บใน Qdrant จะมี metadata เหล่านี้
+        # ซึ่งใช้สำหรับ filter ตอนค้นหา เช่น:
+        #   "ค้นเฉพาะ thai_news"  → filter: {category: "thai_news"}
+        #   "ค้นเฉพาะภาษาไทย"    → filter: {language: "th"}
+        #   "ค้น matichon เท่านั้น" → filter: {source_domain: "matichon.co.th"}
+        #
+        # _extract_domain()  → parse netloc จาก URL เช่น "https://matichon.co.th/abc" → "matichon.co.th"
+        # _resolve_category() → หาว่า domain นี้อยู่ใน topic category ไหนจาก Source Registry
+
+        source_domain = _extract_domain(clean_doc.url)
+        category = _resolve_category(source_domain, clean_doc.metadata)
+
         metadatas = [
             {
-                "document_id": str(doc_id),
+                # ─── Routing fields (มี Payload Index → filter เร็ว) ──────
+                "category":       category,
+                "source_domain":  source_domain,
+                "language":       clean_doc.language or "unknown",
+                "source_type":    str(clean_doc.source_type).replace("SourceType.", "").lower(),
+
+                # ─── Identity fields ──────────────────────────────────────
+                "document_id":    str(doc_id),
                 "document_title": clean_doc.title,
-                "chunk_index": c.chunk_index,
-                "source_type": clean_doc.source_type,
-                "url": clean_doc.url or "",
-                **{k: v for k, v in c.metadata.items() if isinstance(v, (str, int, float, bool))},
+                "chunk_index":    c.chunk_index,
+                "url":            clean_doc.url or "",
+
+                # ─── ค่า extra จาก chunk metadata (เช่น depth, crawled_at) ─
+                **{
+                    k: v
+                    for k, v in c.metadata.items()
+                    if isinstance(v, (str, int, float, bool))
+                },
             }
             for c in chunks
         ]
@@ -195,4 +222,67 @@ class IngestionService:
             db_doc, status=DocumentStatus.INDEXED, chunk_count=len(chunks)
         )
 
-        logger.info("document_indexed", doc_id=str(doc_id), chunks=len(chunks), source=clean_doc.source)
+        logger.info(
+            "document_indexed",
+            doc_id=str(doc_id),
+            chunks=len(chunks),
+            category=category,
+            domain=source_domain,
+            language=clean_doc.language,
+        )
+
+
+# ── Module-level helpers ─────────────────────────────────────────────────────
+
+def _extract_domain(url: str | None) -> str:
+    """
+    Parse domain จาก URL
+
+    ตัวอย่าง:
+      "https://www.matichon.co.th/politics/news/123" → "matichon.co.th"
+      "https://arxiv.org/abs/2401.12345"             → "arxiv.org"
+      None หรือ ""                                   → "unknown"
+
+    ทำไมตัด "www." ออก?
+      เพราะ Source Registry เก็บ domain แบบไม่มี www
+      เช่น "matichon.co.th" ไม่ใช่ "www.matichon.co.th"
+      ถ้าไม่ตัดออก filter จะไม่ match
+    """
+    if not url:
+        return "unknown"
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(url).netloc
+        # ตัด www. ออกถ้ามี
+        return netloc.removeprefix("www.") if netloc else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _resolve_category(domain: str, metadata: dict | None) -> str:
+    """
+    หา category ของ document จาก Source Registry
+
+    กระบวนการ:
+      1. ถ้า metadata มี category ที่ระบุมาแล้ว → ใช้เลย
+         (กรณีที่ task ระบุ category เอง เช่น crawl_and_ingest ของ thai_news)
+      2. ถ้าไม่มี → ค้นหา domain ใน Source Registry
+         เช่น "matichon.co.th" → "thai_news"
+      3. ถ้าไม่เจอใน Registry → "general"
+
+    ทำไมต้องมี fallback เป็น "general"?
+      เพราะ user อาจ upload ไฟล์หรือ crawl URL ที่ไม่ได้อยู่ใน Registry
+      เราไม่อยากให้ document นั้นหายไป แค่ใส่ category "general" แทน
+    """
+    # ถ้า caller ระบุ category มาใน metadata แล้ว → ใช้เลย ไม่ต้อง lookup
+    if metadata and metadata.get("category"):
+        return str(metadata["category"])
+
+    # ค้นหาใน Source Registry ว่า domain นี้อยู่ใน category ไหน
+    if domain and domain != "unknown":
+        from app.sources.registry import REGISTRY
+        for category_name, topic in REGISTRY.items():
+            if domain in topic.domains:
+                return category_name
+
+    return "general"

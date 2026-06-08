@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import crawl, datasets, documents, health, search
+from app.api.routes import crawl, datasets, documents, health, search, sources
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 
@@ -47,3 +47,4 @@ app.include_router(crawl.router, prefix=settings.API_PREFIX)
 app.include_router(documents.router, prefix=settings.API_PREFIX)
 app.include_router(search.router, prefix=settings.API_PREFIX)
 app.include_router(datasets.router, prefix=settings.API_PREFIX)
+app.include_router(sources.router, prefix=settings.API_PREFIX)
